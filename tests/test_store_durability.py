@@ -97,3 +97,69 @@ def test_commit_and_watermark_are_one_transaction(tmp_path, monkeypatch):
     assert store.get_run(run["id"])["status"] == "running"  # still open for retry/cleanup
     store.finish_failed(run["id"], "simulated")
     store.close()
+
+
+def test_legacy_schema_is_migrated_without_losing_runs(tmp_path):
+    """A database from before withdrawal quarantine opens and gains new states."""
+    db = tmp_path / "legacy.sqlite3"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE runs (
+            id TEXT PRIMARY KEY,
+            status TEXT NOT NULL CHECK (
+                status IN ('running', 'succeeded', 'failed', 'cancelled')
+            ),
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            window_from TEXT,
+            window_until TEXT,
+            pages_fetched INTEGER NOT NULL DEFAULT 0,
+            records_seen INTEGER NOT NULL DEFAULT 0,
+            token_restarts INTEGER NOT NULL DEFAULT 0,
+            attempt INTEGER NOT NULL DEFAULT 1,
+            complete_list_size INTEGER,
+            phase TEXT,
+            last_error TEXT,
+            cancel_reason TEXT,
+            watermark_after TEXT
+        );
+        CREATE TABLE run_records (
+            run_id TEXT NOT NULL,
+            identifier TEXT NOT NULL,
+            title TEXT,
+            creator TEXT,
+            datestamp TEXT NOT NULL,
+            deleted INTEGER NOT NULL DEFAULT 0,
+            seq INTEGER NOT NULL,
+            PRIMARY KEY (run_id, identifier),
+            FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+        );
+        INSERT INTO runs (id, status, started_at, window_until, phase)
+        VALUES ('legacy1', 'succeeded', '2026-01-01T00:00:00.000Z',
+                '2026-01-01T00:00:10Z', 'published');
+        INSERT INTO run_records (run_id, identifier, datestamp, deleted, seq)
+        VALUES ('legacy1', 'oai:legacy:1', '2026-01-01T00:00:00Z', 0, 0);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store(db)
+    runs = store.list_runs()
+    assert [run["id"] for run in runs] == ["legacy1"]
+    assert runs[0]["status"] == "succeeded"
+    assert runs[0]["quarantine_deletions"] == 0
+    # The foreign key from run_records still points at runs.
+    fk_target = store._conn.execute(
+        "SELECT \"table\" FROM pragma_foreign_key_list('run_records')"
+    ).fetchone()
+    assert fk_target["table"] == "runs"
+    # New quarantine statuses are now accepted.
+    run = store.create_run()
+    store.set_window(run["id"], "2026-01-02T00:00:00Z")
+    store._conn.execute(
+        "UPDATE runs SET status = 'awaiting_confirmation' WHERE id = ?", (run["id"],)
+    )
+    assert store.get_pending_confirmation()["id"] == run["id"]
+    store.close()

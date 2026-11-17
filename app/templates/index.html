@@ -21,6 +21,43 @@
 
 {% if message %}<div class="flash">{{ message }}</div>{% endif %}
 
+{% if pending %}
+<section class="panel quarantine" id="quarantine-panel">
+  <div class="panel-head">
+    <h2>撤回隔离：待确认</h2>
+    <span class="badge awaiting_confirmation">{{ pending.status }}</span>
+  </div>
+  <p>
+    本轮（<span class="mono">{{ pending.id[:8] }}</span>，时间窗
+    <span class="mono">{{ pending.window_from or "（全量）" }} .. {{ pending.window_until or "—" }}</span>）
+    将删除 <strong>{{ pending.quarantine_deletions }}</strong> 条现存书目，
+    超过当前目录 {{ pending.quarantine_catalog_before }} 条的一半。
+    目录与水位尚未改变，确认前不能启动新轮。最终暂存已保留。
+  </p>
+  <p class="hint">下表列出本轮暂存中的全部 {{ pending_withdrawals|length }} 条撤回标识（其中
+  {{ pending.quarantine_deletions }} 条仍在目录中）。确认将把本轮约
+  {{ pending.staged_count }} 条暂存记录与水位原子发布；驳回将清理暂存，目录和水位保持原样，之后可从原水位重采。</p>
+  <div class="actions">
+    <button id="btn-confirm" class="danger" type="button">确认发布本轮</button>
+    <button id="btn-reject" type="button">驳回并清理暂存</button>
+  </div>
+  <table class="records">
+    <thead>
+      <tr><th>待撤回标识</th><th>当前标题</th><th>源端撤回时间</th></tr>
+    </thead>
+    <tbody>
+    {% for item in pending_withdrawals %}
+      <tr>
+        <td class="mono">{{ item.identifier }}</td>
+        <td>{{ item.current_title or "（目录中已不存在）" }}</td>
+        <td class="mono">{{ item.datestamp }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
 <main class="layout">
   <section class="panel grow">
     <div class="panel-head">

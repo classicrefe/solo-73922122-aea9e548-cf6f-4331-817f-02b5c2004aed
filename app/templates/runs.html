@@ -20,6 +20,13 @@
     <div><span class="label">目录条数</span><strong>{{ published.catalog_size }}</strong></div>
     <div><span class="label">成功轮次</span><strong>{{ published.success_count }}</strong></div>
   </div>
+  {% if pending %}
+  <div class="flash">
+    轮次 <span class="mono">{{ pending.id[:8] }}</span> 等待撤回确认：将删除
+    {{ pending.quarantine_deletions }} 条现存书目（目录共 {{ pending.quarantine_catalog_before }} 条），
+    目录与水位尚未改变。请回到 <a href="/">目录页</a> 确认或驳回。
+  </div>
+  {% endif %}
   <table class="records">
     <thead>
       <tr>
@@ -39,7 +46,11 @@
         <td>{{ run.token_restarts }}</td>
         <td class="mono small">{{ run.watermark_after or "—" }}</td>
         <td class="small">
-          {% if run.cancel_reason %}取消：{{ run.cancel_reason }}{% endif %}
+          {% if run.status == "awaiting_confirmation" %}
+          待确认撤回：删除 {{ run.quarantine_deletions }} / 目录 {{ run.quarantine_catalog_before }} 条
+          {% elif run.status == "rejected" %}
+          驳回：{{ run.cancel_reason or "批量撤回被驳回" }}（目录与水位未改变）
+          {% elif run.cancel_reason %}取消：{{ run.cancel_reason }}{% endif %}
           {% if run.last_error %}{{ run.last_error }}{% endif %}
         </td>
       </tr>

@@ -10,6 +10,8 @@ Pages
 ``POST /api/harvest``          start a round
 ``POST /api/harvest/cancel``   cancel the active round without waiting for it
 ``POST /api/harvest/restart``  cancel (if any) and immediately start a new round
+``POST /api/harvest/confirm``  atomically publish a round held for withdrawal review
+``POST /api/harvest/reject``   discard such a round; catalogue/watermark untouched
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .harvest import HarvestConfig, Harvester
-from .store import Store
+from .store import QUARANTINE_MIN_DELETIONS, Store
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -85,16 +87,22 @@ def create_app(
 
     def status_payload() -> dict[str, Any]:
         active = store.get_active_run()
+        pending = store.get_pending_confirmation()
         published = store.published_state()
         last = store.list_runs(limit=1)
         return {
             "active": active,
+            "pending_confirmation": pending,
+            "pending_withdrawals": (
+                store.pending_withdrawals(pending["id"]) if pending else []
+            ),
             "published": published,
             "last_run": last[0] if last else None,
             "config": {
                 "oai_url": config.oai_url,
                 "max_attempts": config.max_attempts,
                 "read_timeout": config.read_timeout,
+                "quarantine_min_deletions": QUARANTINE_MIN_DELETIONS,
             },
         }
 
@@ -107,6 +115,7 @@ def create_app(
         message: str | None = None,
     ) -> HTMLResponse:
         catalogue = store.catalog_page(q, page, page_size)
+        pending = store.get_pending_confirmation()
         return templates.TemplateResponse(
             request,
             "index.html",
@@ -115,12 +124,17 @@ def create_app(
                 "published": store.published_state(),
                 "status": status_payload(),
                 "runs": store.list_runs(limit=10),
+                "pending": pending,
+                "pending_withdrawals": (
+                    store.pending_withdrawals(pending["id"]) if pending else []
+                ),
                 "message": message,
             },
         )
 
     @app.get("/runs", response_class=HTMLResponse)
     async def runs_page(request: Request) -> HTMLResponse:
+        pending = store.get_pending_confirmation()
         return templates.TemplateResponse(
             request,
             "runs.html",
@@ -128,6 +142,7 @@ def create_app(
                 "runs": store.list_runs(limit=50),
                 "published": store.published_state(),
                 "status": status_payload(),
+                "pending": pending,
             },
         )
 
@@ -155,6 +170,11 @@ def create_app(
     async def cancel_harvest() -> JSONResponse:
         active = store.get_active_run()
         if active is None:
+            if store.get_pending_confirmation() is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="采集已结束，本轮正等待撤回确认；请确认或驳回，不能取消",
+                )
             raise HTTPException(status_code=409, detail="当前没有正在运行的采集轮次")
         await harvester.cancel_run(active["id"], "用户在网页取消", "user")
         return JSONResponse({"run_id": active["id"], "status": "cancelled"})
@@ -179,6 +199,48 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return JSONResponse(
             {"run_id": control.run_id, "status": "running"}, status_code=202
+        )
+
+    @app.post("/api/harvest/confirm")
+    async def confirm_withdrawals() -> JSONResponse:
+        """Publish a quarantined round and advance the watermark, atomically.
+
+        A write failure leaves the round in ``awaiting_confirmation`` with its
+        staging intact, so the request can simply be retried.
+        """
+        pending = store.get_pending_confirmation()
+        if pending is None:
+            raise HTTPException(status_code=409, detail="没有待确认的撤回轮次")
+        try:
+            result = store.confirm_run(pending["id"])
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"确认发布失败，本轮仍待确认，可重试：{exc}",
+            ) from exc
+        return JSONResponse(
+            {
+                "run_id": pending["id"],
+                "status": "succeeded" if result.get("committed") else pending["status"],
+                **result,
+            }
+        )
+
+    @app.post("/api/harvest/reject")
+    async def reject_withdrawals() -> JSONResponse:
+        """Discard the quarantined round; the catalogue and watermark stay."""
+        pending = store.get_pending_confirmation()
+        if pending is None:
+            raise HTTPException(status_code=409, detail="没有待确认的撤回轮次")
+        changed = store.reject_run(pending["id"])
+        if not changed:
+            raise HTTPException(status_code=409, detail="该轮次已不是待确认状态")
+        return JSONResponse(
+            {
+                "run_id": pending["id"],
+                "status": "rejected",
+                "watermark": store.published_state()["watermark"],
+            }
         )
 
     @app.get("/api/catalog")

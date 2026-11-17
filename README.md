@@ -4,7 +4,7 @@
 
 | 服务 | 地址 | 说明 |
 | --- | --- | --- |
-| 采集网页 | http://localhost:8000 | 目录浏览/搜索、进度、开始/取消/取消并重开、轮次记录 |
+| 采集网页 | http://localhost:8000 | 目录浏览/搜索、进度、开始/取消/取消并重开、撤回确认、轮次记录 |
 | 演示 OAI 源 | http://localhost:8001 | OAI-PMH 端点 `/oai`，控制面板 `/`（慢页、令牌失效、撤回等） |
 
 ```bash
@@ -42,12 +42,42 @@ docker compose up --build
 
 ### 提交的原子性
 - `commit_run()` 在**一个 `BEGIN IMMEDIATE` 事务**里：校验本轮仍是活动轮次 →
-  把暂存记录写入/删除 `catalog` → 更新 `published_state.watermark` → 标记本轮成功
-  → 清理暂存。任何一步抛错都会 `ROLLBACK`，目录、水位、成功计数都不变。
+  判断是否触发撤回隔离（见下）→ 把暂存记录写入/删除 `catalog` →
+  更新 `published_state.watermark` → 标记本轮成功 → 清理暂存。任何一步抛错都会
+  `ROLLBACK`，目录、水位、成功计数都不变。
 - 失败、取消、进程崩溃都不会改变已发布内容：
   - 失败/取消：`finish_failed` / `finish_cancelled` 只改本轮状态并清空暂存；
   - 进程崩溃：下次启动时 `Store` 把所有残留的 `running` 轮次标记为失败并清空暂存，
-    同时发布状态完全不动。
+    同时发布状态完全不动。`awaiting_confirmation` 轮次**不会**被清理，重启后仍可确认/驳回。
+- 状态变更由 `CHECK` 约束限定为
+  `running / succeeded / failed / cancelled / awaiting_confirmation / rejected`；
+  旧版数据库启动时会自动重建 `runs` 表以放宽约束并补上隔离字段。
+
+### 撤回隔离（防批量误撤回）
+一轮采集完成后，若本轮暂存中的删除记录**同时**满足：
+
+- 会删掉至少 `3` 条**现存**书目（`run_records.deleted=1` 且 `catalog` 中存在该标识）；
+- 删除数**超过当前目录条数的一半**（严格大于 `catalog_size / 2`）；
+
+则本轮不发布，而是转入 `awaiting_confirmation`：
+
+- 该轮**最终暂存**（`run_records`）和时间窗原样保留，供网页列出待撤回标识与数量；
+- 目录、水位、成功计数一律不变；
+- 该轮仍占用“活动槽”，**不能启动新轮**（`/api/harvest` 与 `/api/harvest/restart`
+  都返回 409；网页的“开始/取消/重开”按钮禁用）；
+- 进程重启后该状态仍可处理（启动恢复会把它重新绑定到活动槽）。
+
+确认与驳回：
+
+- `POST /api/harvest/confirm`：在**一个事务**里把该轮暂存与水位原子发布
+  （与普通提交同一段 `_publish_locked` 逻辑），成功计数只加一次。写入失败会整体
+  `ROLLBACK`，轮次仍为 `awaiting_confirmation`、暂存仍在，可直接重试；对已发布轮次
+  重复确认不会重复写入或重复计数。
+- `POST /api/harvest/reject`：把轮次置为 `rejected` 并清空暂存，目录和水位不动，
+  之后从原水位重新采集即可。
+
+隔离判断只看**最终一次分页尝试**的暂存：令牌失效重取会先清空暂存再重取，
+因此撤回数量不会把已作废尝试里的删除记录重复计入；未触发隔离的轮次照常走原提交路径。
 
 ### 取消：不等待慢页
 - `POST /api/harvest/cancel`：先在 SQLite 里把该轮置为 `cancelled` 并清空暂存（本地事务，
@@ -61,9 +91,11 @@ docker compose up --build
 
 ### 进度可见性
 - 网页每秒轮询 `/api/status`：阶段、时间窗、已取页数、已取记录 / `completeListSize`、
-  令牌失效重取次数、当前尝试次数、已暂存唯一标识数、最近错误。
-- 前端轮询用“代号”防止旧响应覆盖新渲染；轮次开始/结束时整页刷新，使目录和水位
-  立即反映已发布结果。
+  令牌失效重取次数、当前尝试次数、已暂存唯一标识数、最近错误；有待确认轮次时还会
+  返回 `pending_confirmation` 与 `pending_withdrawals`（标识、源端撤回时间、当前标题）。
+- 首页会在目录上方显示撤回隔离面板：待撤回标识与数量、确认/驳回按钮。
+- 前端轮询用“代号”防止旧响应覆盖新渲染；轮次开始/结束或进入/离开待确认状态时整页刷新，
+  使目录和水位立即反映已发布结果。
 
 ## 演示源的能力
 - `Identify` / `ListRecords`（`metadataPrefix=oai_dc`）/ `ListMetadataFormats`；
@@ -73,7 +105,8 @@ docker compose up --build
   - **令牌失效**：`token_failures`，接下来 N 次令牌调用返回
     `badResumptionToken`，并使所有未用令牌作废（重取演示）；
   - 分页大小、令牌 TTL（设为 0 可让令牌立即过期）；
-  - 新增、更正（更新 `datestamp`）、撤回（`status="deleted"`）、恢复、撤回全部。
+  - 新增、更正（更新 `datestamp`）、撤回（`status="deleted"`）、恢复、撤回全部
+    （“撤回全部”可直接演示撤回隔离：一轮里删掉超过一半现存书目时会被拦下待确认）。
 - 演示数据保存在独立 SQLite 卷 `demo-data`，采集网页保存在 `harvester-data`。
 
 ## 配置（docker-compose.yml）

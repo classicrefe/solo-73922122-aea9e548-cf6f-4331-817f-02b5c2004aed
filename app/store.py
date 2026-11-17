@@ -25,6 +25,12 @@ def utc_now_millis() -> str:
     )
 
 
+# A round whose staged deletions would remove at least this many existing
+# catalogue entries *and* more than half of the catalogue is quarantined for
+# human confirmation instead of being published.
+QUARANTINE_MIN_DELETIONS = 3
+
+
 class Store:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
@@ -63,7 +69,8 @@ class Store:
                 CREATE TABLE IF NOT EXISTS runs (
                     id TEXT PRIMARY KEY,
                     status TEXT NOT NULL CHECK (
-                        status IN ('running', 'succeeded', 'failed', 'cancelled')
+                        status IN ('running', 'succeeded', 'failed', 'cancelled',
+                                   'awaiting_confirmation', 'rejected')
                     ),
                     started_at TEXT NOT NULL,
                     finished_at TEXT,
@@ -77,7 +84,9 @@ class Store:
                     phase TEXT,
                     last_error TEXT,
                     cancel_reason TEXT,
-                    watermark_after TEXT
+                    watermark_after TEXT,
+                    quarantine_deletions INTEGER NOT NULL DEFAULT 0,
+                    quarantine_catalog_before INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS run_records (
@@ -107,9 +116,95 @@ class Store:
                 VALUES (1, NULL, NULL, 0, NULL);
                 """
             )
+            self._migrate_runs_table()
+
+    def _migrate_runs_table(self) -> None:
+        """Add columns / widen the status CHECK for databases from older builds.
+
+        ``CREATE TABLE IF NOT EXISTS`` cannot change an existing table, so a
+        database created before withdrawal quarantine existed still has the old
+        four-status CHECK.  Rebuild the table in place, preserving rows.  The
+        foreign key in ``run_records`` must keep pointing at ``runs``; with
+        ``legacy_alter_table`` the rename does not rewrite that reference.
+        """
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(runs)").fetchall()
+        }
+        if "quarantine_deletions" in columns:
+            return
+        self._conn.execute("PRAGMA foreign_keys=OFF")
+        self._conn.execute("PRAGMA legacy_alter_table=ON")
+        old_columns = [
+            "id",
+            "status",
+            "started_at",
+            "finished_at",
+            "window_from",
+            "window_until",
+            "pages_fetched",
+            "records_seen",
+            "token_restarts",
+            "attempt",
+            "complete_list_size",
+            "phase",
+            "last_error",
+            "cancel_reason",
+            "watermark_after",
+        ]
+        present = [name for name in old_columns if name in columns]
+        projected = ", ".join(present)
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute("ALTER TABLE runs RENAME TO runs_pre_quarantine")
+            self._conn.execute(
+                """
+                CREATE TABLE runs (
+                    id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('running', 'succeeded', 'failed', 'cancelled',
+                                   'awaiting_confirmation', 'rejected')
+                    ),
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    window_from TEXT,
+                    window_until TEXT,
+                    pages_fetched INTEGER NOT NULL DEFAULT 0,
+                    records_seen INTEGER NOT NULL DEFAULT 0,
+                    token_restarts INTEGER NOT NULL DEFAULT 0,
+                    attempt INTEGER NOT NULL DEFAULT 1,
+                    complete_list_size INTEGER,
+                    phase TEXT,
+                    last_error TEXT,
+                    cancel_reason TEXT,
+                    watermark_after TEXT,
+                    quarantine_deletions INTEGER NOT NULL DEFAULT 0,
+                    quarantine_catalog_before INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            self._conn.execute(
+                f"""
+                INSERT INTO runs ({projected})
+                SELECT {projected} FROM runs_pre_quarantine
+                """
+            )
+            self._conn.execute("DROP TABLE runs_pre_quarantine")
+            self._conn.execute("COMMIT")
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+        finally:
+            self._conn.execute("PRAGMA legacy_alter_table=OFF")
+            self._conn.execute("PRAGMA foreign_keys=ON")
 
     def _recover_interrupted_runs(self) -> None:
-        """A previous process died.  No in-memory task can own these runs."""
+        """A previous process died.  No in-memory task can own these runs.
+
+        Rounds waiting for withdrawal confirmation are deliberately left
+        intact: they were never published and their staging area is exactly
+        what the operator must be able to confirm or reject after a restart.
+        """
         with self._lock:
             now = utc_now_millis()
             rows = self._conn.execute(
@@ -136,18 +231,38 @@ class Store:
             self._conn.execute(
                 "DELETE FROM meta WHERE key = 'active_run_id'"
             )
+            # Keep blocking new rounds until the pending round is resolved,
+            # but do not require the old meta key to find it.
+            pending = self._conn.execute(
+                "SELECT id FROM runs WHERE status = 'awaiting_confirmation'"
+            ).fetchone()
+            if pending is not None:
+                self._meta_set("active_run_id", pending["id"])
 
     def _ensure_invariants(self) -> None:
-        """At most one round may be ``running``, even across processes.
+        """At most one round may occupy the active slot, across processes.
 
-        Created after recovery so a legacy database with stray ``running``
-        rows cannot make startup fail.
+        The slot is shared by ``running`` and ``awaiting_confirmation`` so a
+        round pending withdrawal review blocks new rounds while a process
+        restarts.  Created after recovery so a legacy database with stray
+        ``running`` rows cannot make startup fail.  An index left by an older
+        build only covered ``running``; it is replaced once.
         """
         with self._lock:
+            existing = self._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' "
+                "AND name = 'idx_runs_one_active'"
+            ).fetchone()
+            if existing is not None and "awaiting_confirmation" in (
+                existing["sql"] or ""
+            ):
+                return
+            self._conn.execute("DROP INDEX IF EXISTS idx_runs_one_active")
             self._conn.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_one_active
-                    ON runs(status) WHERE status = 'running'
+                    ON runs((1))
+                 WHERE status IN ('running', 'awaiting_confirmation')
                 """
             )
 
@@ -193,7 +308,9 @@ class Store:
                 self._conn.execute("COMMIT")
             except sqlite3.IntegrityError as exc:
                 self._conn.execute("ROLLBACK")
-                raise RuntimeError("已有采集轮次在运行") from exc
+                raise RuntimeError(
+                    "已有采集轮次在运行或等待撤回确认"
+                ) from exc
             except BaseException:
                 self._conn.execute("ROLLBACK")
                 raise
@@ -226,6 +343,17 @@ class Store:
             row = self._conn.execute(
                 """
                 SELECT * FROM runs WHERE status = 'running'
+                 ORDER BY started_at DESC LIMIT 1
+                """
+            ).fetchone()
+            return self.get_run(row["id"]) if row else None
+
+    def get_pending_confirmation(self) -> dict[str, Any] | None:
+        """The round (if any) whose withdrawals await human confirmation."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT * FROM runs WHERE status = 'awaiting_confirmation'
                  ORDER BY started_at DESC LIMIT 1
                 """
             ).fetchone()
@@ -340,8 +468,12 @@ class Store:
                     (utc_now_millis(), reason[:1000], run_id),
                 )
                 changed = cur.rowcount > 0
-                self._delete_stage(run_id)
                 if changed:
+                    # Only the round that was actually still running loses its
+                    # staging.  A round in ``awaiting_confirmation`` keeps its
+                    # final staging so it can still be confirmed after a
+                    # shutdown/restart.
+                    self._delete_stage(run_id)
                     self._clear_active_if(run_id)
                 self._conn.execute("COMMIT")
                 return changed
@@ -366,8 +498,8 @@ class Store:
                     (utc_now_millis(), error[:4000], run_id),
                 )
                 changed = cur.rowcount > 0
-                self._delete_stage(run_id)
                 if changed:
+                    self._delete_stage(run_id)
                     self._clear_active_if(run_id)
                 self._conn.execute("COMMIT")
                 return changed
@@ -441,8 +573,128 @@ class Store:
         if self._meta_get("active_run_id") == run_id:
             self._meta_set("active_run_id", None)
 
+    def _staged_rows(self, run_id: str) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            """
+            SELECT identifier, title, creator, datestamp, deleted
+              FROM run_records WHERE run_id = ?
+             ORDER BY seq
+            """,
+            (run_id,),
+        ).fetchall()
+
+    def _publish_locked(
+        self, run_id: str, run: sqlite3.Row, now: str
+    ) -> dict[str, Any]:
+        """Copy staging into the catalogue and advance the watermark.
+
+        Must be called inside an already-open IMMEDIATE transaction.  Returns
+        the commit summary; never commits or rolls back itself, so callers can
+        make publication and their own state change one atomic unit.
+        """
+        rows = self._staged_rows(run_id)
+        upserts = 0
+        deletions = 0
+        for row in rows:
+            if row["deleted"]:
+                self._conn.execute(
+                    "DELETE FROM catalog WHERE identifier = ?",
+                    (row["identifier"],),
+                )
+                deletions += 1
+            else:
+                self._conn.execute(
+                    """
+                    INSERT INTO catalog
+                        (identifier, title, creator, source_datestamp,
+                         harvested_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(identifier) DO UPDATE SET
+                        title = excluded.title,
+                        creator = excluded.creator,
+                        source_datestamp = excluded.source_datestamp,
+                        harvested_at = excluded.harvested_at
+                    """,
+                    (
+                        row["identifier"],
+                        row["title"] or "",
+                        row["creator"],
+                        row["datestamp"],
+                        now,
+                    ),
+                )
+                upserts += 1
+
+        watermark = run["window_until"]
+        self._conn.execute(
+            """
+            UPDATE published_state
+               SET watermark = ?,
+                   updated_at = ?,
+                   success_count = success_count + 1,
+                   last_run_id = ?
+             WHERE id = 1
+            """,
+            (watermark, now, run_id),
+        )
+        self._conn.execute(
+            """
+            UPDATE runs
+               SET status = 'succeeded',
+                   finished_at = ?,
+                   phase = 'published',
+                   watermark_after = ?,
+                   last_error = NULL
+             WHERE id = ?
+            """,
+            (now, watermark, run_id),
+        )
+        self._clear_active_if(run_id)
+        self._delete_stage(run_id)
+        return {
+            "committed": True,
+            "upserts": upserts,
+            "deletions": deletions,
+            "watermark": watermark,
+        }
+
+    def _withdrawal_impact_locked(self, run_id: str) -> tuple[int, int]:
+        """(deletions of currently-catalogued identifiers, catalogue size)."""
+        row = self._conn.execute(
+            """
+            SELECT COUNT(*) AS n
+              FROM run_records r
+             WHERE r.run_id = ?
+               AND r.deleted = 1
+               AND EXISTS (SELECT 1 FROM catalog c
+                            WHERE c.identifier = r.identifier)
+            """,
+            (run_id,),
+        ).fetchone()
+        deletions = int(row["n"] or 0)
+        size = int(
+            self._conn.execute("SELECT COUNT(*) AS n FROM catalog").fetchone()["n"]
+        )
+        return deletions, size
+
+    @staticmethod
+    def _requires_confirmation(deletions: int, catalog_before: int) -> bool:
+        return (
+            deletions >= QUARANTINE_MIN_DELETIONS
+            and deletions * 2 > catalog_before
+        )
+
     def commit_run(self, run_id: str) -> dict[str, Any]:
         """Atomically publish staging and advance the watermark.
+
+        If the staged result would delete at least ``QUARANTINE_MIN_DELETIONS``
+        existing catalogue entries and more than half of the catalogue, the
+        round is *not* published.  Instead it moves to
+        ``awaiting_confirmation`` in this same transaction: the final staging
+        rows and the time window are kept, the catalogue and watermark are
+        untouched, and the round keeps occupying the active slot so no new
+        round can start.  Confirmation/rejection then happens through
+        :meth:`confirm_run` / :meth:`reject_run`.
 
         The check for ownership (``active_run_id``) happens inside the same
         IMMEDIATE transaction as the catalogue writes.  A cancelled or
@@ -465,81 +717,112 @@ class Store:
                     self._conn.execute("ROLLBACK")
                     return {"committed": False, "reason": "run is not active"}
 
-                rows = self._conn.execute(
-                    """
-                    SELECT identifier, title, creator, datestamp, deleted
-                      FROM run_records WHERE run_id = ?
-                     ORDER BY seq
-                    """,
-                    (run_id,),
-                ).fetchall()
+                deletions, catalog_before = self._withdrawal_impact_locked(run_id)
+                if self._requires_confirmation(deletions, catalog_before):
+                    self._conn.execute(
+                        """
+                        UPDATE runs
+                           SET status = 'awaiting_confirmation',
+                               finished_at = ?,
+                               phase = 'awaiting_confirmation',
+                               quarantine_deletions = ?,
+                               quarantine_catalog_before = ?,
+                               last_error = NULL
+                         WHERE id = ?
+                        """,
+                        (
+                            utc_now_millis(),
+                            deletions,
+                            catalog_before,
+                            run_id,
+                        ),
+                    )
+                    # Staging is intentionally retained for the confirmation
+                    # step; active_run_id also remains set so restart recovery
+                    # finds this round and new rounds stay blocked.
+                    self._conn.execute("COMMIT")
+                    return {
+                        "committed": False,
+                        "quarantined": True,
+                        "deletions": deletions,
+                        "catalog_before": catalog_before,
+                    }
 
-                now = utc_now_millis()
-                upserts = 0
-                deletions = 0
-                for row in rows:
-                    if row["deleted"]:
-                        self._conn.execute(
-                            "DELETE FROM catalog WHERE identifier = ?",
-                            (row["identifier"],),
-                        )
-                        deletions += 1
-                    else:
-                        self._conn.execute(
-                            """
-                            INSERT INTO catalog
-                                (identifier, title, creator, source_datestamp,
-                                 harvested_at)
-                            VALUES (?, ?, ?, ?, ?)
-                            ON CONFLICT(identifier) DO UPDATE SET
-                                title = excluded.title,
-                                creator = excluded.creator,
-                                source_datestamp = excluded.source_datestamp,
-                                harvested_at = excluded.harvested_at
-                            """,
-                            (
-                                row["identifier"],
-                                row["title"] or "",
-                                row["creator"],
-                                row["datestamp"],
-                                now,
-                            ),
-                        )
-                        upserts += 1
+                result = self._publish_locked(run_id, run, utc_now_millis())
+                result["quarantined"] = False
+                self._conn.execute("COMMIT")
+                return result
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
 
-                watermark = run["window_until"]
-                self._conn.execute(
-                    """
-                    UPDATE published_state
-                       SET watermark = ?,
-                           updated_at = ?,
-                           success_count = success_count + 1,
-                           last_run_id = ?
-                     WHERE id = 1
-                    """,
-                    (watermark, now, run_id),
-                )
-                self._conn.execute(
+    def confirm_run(self, run_id: str) -> dict[str, Any]:
+        """Publish a quarantined round atomically after human confirmation.
+
+        Idempotent and retryable:
+
+        * a write failure rolls back the whole transaction, so the round stays
+          ``awaiting_confirmation`` with its staging intact and can be retried;
+        * a repeated confirmation of an already-published round reports
+          ``committed: False`` and changes nothing (no double success count);
+        * a round in any other state is refused.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                run = self._conn.execute(
+                    "SELECT * FROM runs WHERE id = ?", (run_id,)
+                ).fetchone()
+                if run is None:
+                    self._conn.execute("ROLLBACK")
+                    return {"committed": False, "reason": "轮次不存在"}
+                if run["status"] == "succeeded":
+                    self._conn.execute("ROLLBACK")
+                    return {
+                        "committed": False,
+                        "already_committed": True,
+                        "reason": "本轮已发布，无需重复确认",
+                    }
+                if run["status"] != "awaiting_confirmation":
+                    self._conn.execute("ROLLBACK")
+                    return {
+                        "committed": False,
+                        "reason": f"本轮状态为 {run['status']}，不在待确认状态",
+                    }
+                if not run["window_until"]:
+                    self._conn.execute("ROLLBACK")
+                    return {"committed": False, "reason": "本轮缺少时间窗"}
+
+                result = self._publish_locked(run_id, run, utc_now_millis())
+                self._conn.execute("COMMIT")
+                result["quarantined"] = False
+                return result
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def reject_run(self, run_id: str, reason: str = "用户驳回了批量撤回") -> bool:
+        """Discard a quarantined round; catalogue and watermark stay as-is."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = self._conn.execute(
                     """
                     UPDATE runs
-                       SET status = 'succeeded',
-                           finished_at = ?,
-                           phase = 'published',
-                           watermark_after = ?,
-                           last_error = NULL
-                     WHERE id = ?
+                       SET status = 'rejected',
+                           finished_at = COALESCE(finished_at, ?),
+                           phase = 'rejected',
+                           cancel_reason = COALESCE(cancel_reason, ?)
+                     WHERE id = ? AND status = 'awaiting_confirmation'
                     """,
-                    (now, watermark, run_id),
+                    (utc_now_millis(), reason[:1000], run_id),
                 )
-                self._clear_active_if(run_id)
-                self._delete_stage(run_id)
+                changed = cur.rowcount > 0
+                if changed:
+                    self._delete_stage(run_id)
+                    self._clear_active_if(run_id)
                 self._conn.execute("COMMIT")
-                return {
-                    "committed": True,
-                    "upserts": upserts,
-                    "deletions": deletions,
-                    "watermark": watermark,
-                }
+                return changed
             except BaseException:
                 self._conn.execute("ROLLBACK")
                 raise
@@ -559,15 +842,19 @@ class Store:
                     """,
                     (utc_now_millis(), error[:4000], run_id),
                 )
-                self._delete_stage(run_id)
-                self._clear_active_if(run_id)
+                changed = cur.rowcount > 0
+                if changed:
+                    self._delete_stage(run_id)
+                    self._clear_active_if(run_id)
                 self._conn.execute("COMMIT")
-                return cur.rowcount > 0
+                return changed
             except BaseException:
                 self._conn.execute("ROLLBACK")
                 raise
 
     def cancel_run(self, run_id: str, reason: str) -> bool:
+        """Cancel a running round.  A pending-confirmation round is not running,
+        so its retained staging is never touched here (shutdown calls this)."""
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -582,15 +869,38 @@ class Store:
                     """,
                     (utc_now_millis(), reason[:1000], run_id),
                 )
-                self._delete_stage(run_id)
-                self._clear_active_if(run_id)
+                changed = cur.rowcount > 0
+                if changed:
+                    self._delete_stage(run_id)
+                    self._clear_active_if(run_id)
                 self._conn.execute("COMMIT")
-                return cur.rowcount > 0
+                return changed
             except BaseException:
                 self._conn.execute("ROLLBACK")
                 raise
 
     # --------------------------------------------------------------- published
+    def pending_withdrawals(self, run_id: str | None = None) -> list[dict[str, Any]]:
+        """Identifiers a quarantined round would delete from the catalogue."""
+        with self._lock:
+            if run_id is None:
+                pending = self.get_pending_confirmation()
+                if pending is None:
+                    return []
+                run_id = pending["id"]
+            rows = self._conn.execute(
+                """
+                SELECT r.identifier, r.datestamp,
+                       c.title AS current_title
+                  FROM run_records r
+                  LEFT JOIN catalog c ON c.identifier = r.identifier
+                 WHERE r.run_id = ? AND r.deleted = 1
+                 ORDER BY r.identifier
+                """,
+                (run_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
     def published_state(self) -> dict[str, Any]:
         with self._lock:
             row = self._conn.execute(

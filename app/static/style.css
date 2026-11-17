@@ -99,6 +99,15 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .badge.succeeded { background: #e3f5ea; color: var(--ok); }
 .badge.failed { background: #fdecea; color: var(--danger); }
 .badge.cancelled { background: #fdf3e3; color: var(--warn); }
+.badge.awaiting_confirmation { background: #fff1d6; color: #8a5a00; }
+.badge.rejected { background: #f0e9f7; color: #6b3fa0; }
+
+.quarantine {
+  border: 2px solid #e0b357; background: #fffaf0;
+  margin: 14px 28px 0;
+}
+.quarantine h2 { color: #8a5a00; }
+.quarantine .records { background: #fff; }
 
 .runlist { margin: 0; padding-left: 18px; font-size: 13px; }
 .runlist li { margin-bottom: 7px; line-height: 1.5; }

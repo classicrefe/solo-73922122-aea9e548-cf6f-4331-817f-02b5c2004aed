@@ -122,6 +122,11 @@ class Harvester:
     # ------------------------------------------------------------- lifecycle
     async def start_run(self) -> RunControl:
         async with self._lock:
+            pending = self.store.get_pending_confirmation()
+            if pending is not None:
+                raise RuntimeError(
+                    f"有待撤回确认的轮次: {pending['id']}，请先确认或驳回"
+                )
             active = self.store.get_active_run()
             if active is not None:
                 raise RuntimeError(f"已有采集轮次在运行: {active['id']}")
@@ -205,8 +210,8 @@ class Harvester:
     async def _run(self, control: RunControl) -> None:
         run_id = control.run_id
         try:
-            await self._harvest(control)
-            control.resolve("succeeded")
+            outcome = await self._harvest(control)
+            control.resolve(outcome or "succeeded")
         except asyncio.CancelledError:
             # cancel_run() has already persisted 'cancelled'; if the task was
             # cancelled for another reason (e.g. event loop shutdown), make
@@ -232,7 +237,10 @@ class Harvester:
                             del self._controls[key]
 
     # --------------------------------------------------------------- one run
-    async def _harvest(self, control: RunControl) -> None:
+    async def _harvest(self, control: RunControl) -> str | None:
+        """Run one harvest.  Returns ``"awaiting_confirmation"`` when the
+        completed round was quarantined for withdrawal review, otherwise
+        ``None`` (a normal publish)."""
         run_id = control.run_id
         store = self.store
 
@@ -342,12 +350,17 @@ class Harvester:
                 phase="committing",
             )
             result = store.commit_run(run_id)
+            if result.get("quarantined"):
+                # The round's final staging and window are kept for review;
+                # catalogue, watermark and active slot are unchanged.
+                return "awaiting_confirmation"
             if not result.get("committed"):
                 if not store.is_run_running(run_id):
                     raise HarvestCancelled(
                         control.cancel_reason or "本轮在提交前被取消"
                     )
                 raise HarvestFailed(f"提交被拒绝: {result.get('reason')}")
+            return None
 
     async def _backoff(self, control: RunControl) -> None:
         delay_ms = self.config.retry_backoff_ms + random.randint(
